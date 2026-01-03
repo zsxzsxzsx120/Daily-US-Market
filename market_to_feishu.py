@@ -2,86 +2,104 @@ import yfinance as yf
 import pandas as pd
 import requests
 import os
+import sys
 from datetime import datetime
 
-# --- 配置区 ---
-# 建议在 GitHub Actions 中设置环境变量，不要直接把 Webhook 写在代码里
-WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK", "这里填写你的飞书Webhook地址")
+# --- 配置 ---
+WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK")
 
+# 缩减资产列表，确保在手机窄屏上也能完美对齐
 ASSETS = {
-    "美元": "DX-Y.NYB", "2年美债": "^IRX", "10年美债": "^TNX", "TLT": "TLT",
-    "标普500": "^GSPC", "纳指": "^IXIC", "道指": "^DJI", "黄金": "GC=F",
-    "WTI原油": "CL=F", "VIX": "^VIX", "罗素2000": "^RUT", "比特币": "BTC-USD",
-    "科技(XLK)": "XLK", "芯片(SOXX)": "SOXX", "金融(XLF)": "XLF", "医疗(XLV)": "XLV"
+    "标普500": "^GSPC", "纳指100": "^NDX", "道琼斯": "^DJI", "罗素2000": "^RUT",
+    "10年美债": "^TNX", "2年美债": "^IRX", "美元指数": "DX-Y.NYB", "TLT(债)": "TLT",
+    "现货黄金": "GC=F", "WTI原油": "CL=F", "比特币": "BTC-USD",
+    "半导体": "SOXX", "科技股": "XLK", "金融股": "XLF", "医疗股": "XLV"
 }
 
-def get_market_data():
-    all_tickers = list(ASSETS.values())
-    raw = yf.download(all_tickers, period="2y", interval="1d", progress=False)
-    data = raw['Close'] if isinstance(raw.columns, pd.MultiIndex) else raw
-    
-    today = data.index[-1]
-    date_str = today.strftime('%Y-%m-%d')
-    
-    results = []
-    for name, symbol in ASSETS.items():
-        try:
-            series = data[symbol].dropna()
-            curr = series.iloc[-1]
+def get_data():
+    try:
+        raw = yf.download(list(ASSETS.values()), period="2y", interval="1d", progress=False)
+        data = raw['Close'] if isinstance(raw.columns, pd.MultiIndex) else raw
+        today = data.index[-1]
+        
+        results = []
+        ytd_start = pd.Timestamp(datetime(today.year, 1, 1))
+        
+        for name, sym in ASSETS.items():
+            s = data[sym].dropna()
+            curr = s.iloc[-1]
+            # 变动计算逻辑：债收益率算点数，其他算百分比
+            is_yield = "^" in sym and sym not in ["^GSPC", "^NDX", "^DJI", "^RUT"]
             
-            # 计算函数 (收益率算绝对变动，其他算%)
             def calc(old):
-                val = (curr - old) if "^" in symbol and "G" not in symbol else (curr / old - 1) * 100
-                return round(val, 2)
+                val = (curr - old) if is_yield else (curr/old - 1)*100
+                return val
 
             results.append({
                 "name": name,
-                "price": round(curr, 2),
-                "d1": calc(series.iloc[-2]),
-                "w1": calc(series.iloc[-6]),
-                "ytd": calc(series.loc[series.index >= pd.Timestamp(datetime(today.year, 1, 1))].iloc[0])
+                "price": f"{curr:.1f}" if curr > 100 else f"{curr:.2f}",
+                "d1": calc(s.iloc[-2]),
+                "ytd": calc(s.loc[s.index >= ytd_start].iloc[0])
             })
-        except: continue
-    return results, date_str
+        return results, today.strftime('%Y-%m-%d')
+    except Exception as e:
+        print(f"数据抓取失败: {e}")
+        return None, None
 
-def send_feishu_card(data_list, date_str):
-    # 构造卡片内容
-    rows = []
+def build_card(data_list, date_str):
+    # 分成三列：资产名、收盘价、涨跌幅(1D/YTD合并)
+    col_names = []
+    col_prices = []
+    col_changes = []
+
     for item in data_list:
-        # 根据涨跌选择 emoji 和 颜色
-        color = "🟢" if item['d1'] >= 0 else "🔴"
-        row_str = f"{color} **{item['name']}**: {item['price']} | 1D: **{item['d1']}%** | YTD: {item['ytd']}%"
-        rows.append(row_str)
+        emoji = "🟩" if item['d1'] >= 0 else "🟥"
+        col_names.append(f"{item['name']}")
+        col_prices.append(f"**{item['price']}**")
+        col_changes.append(f"{emoji} {item['d1']:+.1f}% | {item['ytd']:+.1f}%")
 
-    # 飞书卡片 JSON 结构
     payload = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": f"📊 美股市场日报 {date_str}"},
-                "template": "blue"
+                "title": {"tag": "plain_text", "content": f"📊 美股日报 {date_str}"},
+                "template": "blue" # 蓝色页眉
             },
             "elements": [
                 {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": "\n".join(rows)}
+                    "tag": "column_set",
+                    "flex_mode": "stretch",
+                    "columns": [
+                        {
+                            "tag": "column", "width": "weighted", "weight": 1,
+                            "elements": [{"tag": "markdown", "content": "\n".join(col_names)}]
+                        },
+                        {
+                            "tag": "column", "width": "weighted", "weight": 1,
+                            "elements": [{"tag": "markdown", "content": "\n".join(col_prices)}]
+                        },
+                        {
+                            "tag": "column", "width": "weighted", "weight": 2,
+                            "elements": [{"tag": "markdown", "content": "\n".join(col_changes)}]
+                        }
+                    ]
                 },
                 {"tag": "hr"},
                 {
                     "tag": "note",
-                    "elements": [{"tag": "plain_text", "content": "数据来源: Yahoo Finance | 自动推送"}]
+                    "elements": [{"tag": "plain_text", "content": "列说明：资产 | 现价 | 当日涨跌% | YTD%"}]
                 }
             ]
         }
     }
-    
-    response = requests.post(WEBHOOK_URL, json=payload)
-    if response.status_code == 200:
-        print("卡片发送成功！")
-    else:
-        print(f"发送失败: {response.text}")
+    return payload
 
 if __name__ == "__main__":
-    results, date_header = get_market_data()
-    send_feishu_card(results, date_header)
+    results, date_header = get_data()
+    if results:
+        card = build_card(results, date_header)
+        r = requests.post(WEBHOOK_URL, json=card)
+        print(f"发送结果: {r.status_code}")
+    else:
+        sys.exit(1)
